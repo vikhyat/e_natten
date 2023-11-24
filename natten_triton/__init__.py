@@ -108,9 +108,10 @@ class Natten1d(torch.autograd.Function):
             v_tile = v[:, :, kv_start:kv_start+k_tile_size, :]
 
             # Load a little extra O and Q to account for the assymmetric neighborhood mapping.
-            q_start = get_backward_window_start(kv_start, kernel_size)
-            q_end = get_backward_window_end(kv_start + k_tile_size - 1, T, kernel_size)
-            q_tile = q[:, :, q_start:q_end, :]
+            oq_start = get_backward_window_start(kv_start, kernel_size)
+            oq_offset = oq_start - i
+            oq_end = get_backward_window_end(kv_start + k_tile_size - 1, T, kernel_size)
+            q_tile = q[:, :, oq_start:oq_end, :]
             dS_tile = dS[:, :, i:i+Q_TILE_SIZE, :]
 
             # Process each element in the query tile.
@@ -125,6 +126,6 @@ class Natten1d(torch.autograd.Function):
                 dQ_j = dS_tile[:, :, j:j+1, :] @ k_tile[:, :, j2:j2+kernel_size, :]
                 dQ = torch.cat((dQ, dQ_j), dim=2)
 
-        return dQ, dK, dQ, None
+        return dQ, dQ, dQ, None
 
 natten1d = Natten1d.apply
