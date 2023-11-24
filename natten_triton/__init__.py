@@ -96,7 +96,6 @@ class Natten1d(torch.autograd.Function):
         # the forward pass.
 
         dQ = torch.zeros(B, H, 0, C)
-        dK = torch.zeros(B, H, 0, C)
         
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
@@ -104,15 +103,9 @@ class Natten1d(torch.autograd.Function):
         for i in range(0, T, Q_TILE_SIZE):
             dS_tile = dS[:, :, i:i+Q_TILE_SIZE, :]
 
-            # Load k and v tiles.
+            # Load k tile.
             kv_start = get_window_start(i, T, kernel_size)
             k_tile = k[:, :, kv_start:kv_start+k_tile_size, :]
-            v_tile = v[:, :, kv_start:kv_start+k_tile_size, :]
-
-            # Load a little extra O and Q to account for the assymmetric neighborhood mapping.
-            q_start = get_backward_window_start(kv_start, kernel_size)
-            q_end = get_backward_window_end(kv_start + k_tile_size - 1, T, kernel_size)
-            q_tile = q[:, :, q_start:q_end, :]
 
             # Process each element in the query tile.
             iter_max = min(Q_TILE_SIZE, dS_tile.shape[2])
@@ -126,6 +119,18 @@ class Natten1d(torch.autograd.Function):
                 dQ_j = dS_tile[:, :, j:j+1, :] @ k_tile[:, :, j2:j2+kernel_size, :]
                 dQ = torch.cat((dQ, dQ_j), dim=2)
 
-        return dQ, dQ, dQ, None
+        # Just do the naive thing for dK and dV. Can add tiling later.
+        dK = torch.zeros(B, H, T, C)
+        for i in range(T):
+            ni = get_backward_window_start(i, kernel_size)
+            ne = get_backward_window_end(i, T, kernel_size)
+            for xi in range(ni, ne):
+                oni = get_window_start(xi, T, kernel_size)
+                si = oni - i
+                q_slice = q[:, :, xi, :]
+                dS_slice = dS[:, :, xi, si].unsqueeze(-1)
+                dK[:, :, i, :] += q_slice * dS_slice
+
+        return dQ, dK, dQ, None
 
 natten1d = Natten1d.apply
