@@ -28,10 +28,10 @@ if __name__ == '__main__':
     v_2 = v.detach().clone()
     o_2 = natten1d(q_2, k_2, v_2, kernel_size)
 
-    print('1D forward pass:', torch.allclose(s, o_2, atol=1e-5))
+    print('1D forward pass:', torch.allclose(p, o_2, atol=1e-5))
 
     # Check backward pass.
-    loss = torch.sum(s)
+    loss = torch.sum(p)
     loss.backward()
     loss_2 = torch.sum(o_2)
     loss_2.backward()

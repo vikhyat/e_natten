@@ -39,19 +39,19 @@ class Natten1d(torch.autograd.Function):
         # of size Q_TILE_SIZE + kernel_size - 1. The output of each tile is stored in o.
         o = torch.zeros(B, H, 0, C)
         k_tile_size = Q_TILE_SIZE + kernel_size - 1
-        _qk = torch.zeros(B, H, 0, kernel_size)
+        _p = torch.zeros(B, H, 0, kernel_size)
 
         for i in range(0, T, Q_TILE_SIZE):
-            q_tile = q[:, :, i:i+Q_TILE_SIZE, :]
+            Q_tile = q[:, :, i:i+Q_TILE_SIZE, :]
             kv_start = get_window_start(i, T, kernel_size)
             
             # Load k tile and allocate space for s. Load v tile as well to avoid stalling later.
-            k_tile = k[:, :, kv_start:kv_start+k_tile_size, :]
-            v_tile = v[:, :, kv_start:kv_start+k_tile_size, :]
-            s = torch.zeros((B, H, 0, kernel_size))
+            K_tile = k[:, :, kv_start:kv_start+k_tile_size, :]
+            V_tile = v[:, :, kv_start:kv_start+k_tile_size, :]
+            P_tile = torch.zeros((B, H, 0, kernel_size))
             
             # For each element in the query tile, compute QK^T using the relevant slice of the key tile.
-            iter_max = min(Q_TILE_SIZE, q_tile.shape[2])
+            iter_max = min(Q_TILE_SIZE, Q_tile.shape[2])
             for j in range(0, iter_max):
                 if i <= kernel_size // 2:
                     j2 = 0
@@ -60,12 +60,10 @@ class Natten1d(torch.autograd.Function):
                 else:
                     j2 = j
 
-                s_j = q_tile[:, :, j:j+1, :] @ k_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
-                s = torch.cat((s, s_j), dim=2)
-                _qk = torch.cat((_qk, s_j), dim=2)
-            
-            # Compute softmax.
-            p = torch.softmax(s, dim=-1)
+                S_j = Q_tile[:, :, j:j+1, :] @ K_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
+                P_j = torch.softmax(S_j, dim=-1)
+                P_tile = torch.cat((P_tile, P_j), dim=2)
+                _p = torch.cat((_p, P_j), dim=2)
 
             for j in range(0, iter_max):
                 if i <= kernel_size // 2:
@@ -74,26 +72,29 @@ class Natten1d(torch.autograd.Function):
                     j2 = T - kv_start - kernel_size
                 else:
                     j2 = j
-                o_j = p[:, :, j:j+1, :] @ v_tile[:, :, j2:j2+kernel_size, :]
+                o_j = P_tile[:, :, j:j+1, :] @ V_tile[:, :, j2:j2+kernel_size, :]
                 o = torch.cat((o, o_j), dim=2)
 
-        ctx.save_for_backward(q, k, v, o)
+        ctx.save_for_backward(q, k, v, _p)
         ctx.kernel_size = kernel_size
 
-        return _qk
+        return _p
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, o = ctx.saved_tensors
+        Q, K, v, O = ctx.saved_tensors
         kernel_size = ctx.kernel_size
-        B, H, T, C = q.shape
+        B, H, T, C = Q.shape
 
-        dS = grad_output
+        dO = grad_output
+
+        # Precompute to assist with calculating dsoftmax later.
+        D = torch.sum(dO * O, dim=-1)
+
+        dP = grad_output
         
         # dQ has the same neighborhood pattern, but dK and dV need us to invert the
-        # neighborhood mapping, which is not symmetric. Let's start with dQ since
-        # it's easier -- we're basically going to take the same tiled approach as
-        # the forward pass.
+        # neighborhood mapping, which is not symmetric. 
 
         dQ = torch.zeros(B, H, 0, C)
         
@@ -101,14 +102,15 @@ class Natten1d(torch.autograd.Function):
         # of size Q_TILE_SIZE + kernel_size - 1. 
         k_tile_size = Q_TILE_SIZE + kernel_size - 1
         for i in range(0, T, Q_TILE_SIZE):
-            dS_tile = dS[:, :, i:i+Q_TILE_SIZE, :]
+            dP_tile = dP[:, :, i:i+Q_TILE_SIZE, :]
+            Q_tile = Q[:, :, i:i+Q_TILE_SIZE, :]
 
             # Load k tile.
             kv_start = get_window_start(i, T, kernel_size)
-            k_tile = k[:, :, kv_start:kv_start+k_tile_size, :]
+            K_tile = K[:, :, kv_start:kv_start+k_tile_size, :]
 
             # Process each element in the query tile.
-            iter_max = min(Q_TILE_SIZE, dS_tile.shape[2])
+            iter_max = min(Q_TILE_SIZE, dP_tile.shape[2])
             for j in range(0, iter_max):
                 if i <= kernel_size // 2:
                     j2 = 0
@@ -116,8 +118,13 @@ class Natten1d(torch.autograd.Function):
                     j2 = T - kv_start - kernel_size
                 else:
                     j2 = j
-                dQ_j = dS_tile[:, :, j:j+1, :] @ k_tile[:, :, j2:j2+kernel_size, :]
+
+                P_j = Q_tile[:, :, j:j+1, :] @ K_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
+                dP_j = dP_tile[:, :, j:j+1, :]
+                dS_j = P_j * (dP_j - D[:, :, j:j+1].unsqueeze(2))
+                dQ_j = dS_j @ K_tile[:, :, j2:j2+kernel_size, :]
                 dQ = torch.cat((dQ, dQ_j), dim=2)
+
 
         # Just do the naive thing for dK and dV. Can add tiling later.
         dK = torch.zeros(B, H, T, C)
@@ -127,9 +134,12 @@ class Natten1d(torch.autograd.Function):
             for xi in range(ni, ne):
                 oni = get_window_start(xi, T, kernel_size)
                 si = oni - i
-                q_slice = q[:, :, xi, :]
-                dS_slice = dS[:, :, xi, si].unsqueeze(-1)
-                dK[:, :, i, :] += q_slice * dS_slice
+                Q_slice = Q[:, :, xi, :]
+                P_xi = Q_slice.unsqueeze(2) @ K[:, :, oni:oni+kernel_size, :].transpose(-1, -2)
+                dP_xi = dP[:, :, xi:xi+1, :]
+                dS_xi = P_xi * (dP_xi - D[:, :, xi:xi+1].unsqueeze(-1))
+                dS_slice = dS_xi[:, :, 0, si].unsqueeze(-1)
+                dK[:, :, i, :] += Q_slice * dS_slice
 
         return dQ, dK, dQ, None
 
