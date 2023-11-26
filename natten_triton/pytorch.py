@@ -222,53 +222,68 @@ class Natten2d(torch.autograd.Function):
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
         k_tile_size = TILE_SIZE + kernel_size - 1
-        for i in range(0, T, TILE_SIZE):
-            dO_tile = dO[:, :, i:i+TILE_SIZE, :]
-            Q_tile = Q[:, :, i:i+TILE_SIZE, :]
 
-            # Load k tile.
-            kv_start = get_window_start(i, T, kernel_size)
-            K_tile = K[:, :, kv_start:kv_start+k_tile_size, :]
-            V_tile = V[:, :, kv_start:kv_start+k_tile_size, :]
+        for x in range(0, H, TILE_SIZE):
+            for y in range(0, W, TILE_SIZE):
+                dO_tile = dO[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
+                Q_tile = Q[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
 
-            # Process each element in the query tile.
-            iter_max = min(TILE_SIZE, Q_tile.shape[2])
-            for j in range(0, iter_max):
-                if i + j <= kernel_size // 2:
-                    j2 = 0
-                elif i + j >= T - kernel_size // 2 - 1:
-                    j2 = T - kv_start - kernel_size
-                else:
-                    j2 = j
+                # Load K and V tiles.
+                x_kv_start = get_window_start(x, H, kernel_size)
+                y_kv_start = get_window_start(y, W, kernel_size)
+                K_tile = K[:, :, x_kv_start:x_kv_start+k_tile_size, y_kv_start:y_kv_start+k_tile_size, :]
+                V_tile = V[:, :, x_kv_start:x_kv_start+k_tile_size, y_kv_start:y_kv_start+k_tile_size, :]
 
-                S_j = Q_tile[:, :, j:j+1, :] @ K_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
-                P_j = torch.softmax(S_j, dim=-1)
-                P_j_jacobian = softmax_jacobian(P_j)
-                dP_j = dO_tile[:, :, j:j+1, :] @ V_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
-                dS_j = torch.matmul(P_j_jacobian, dP_j.transpose(-1, -2)).transpose(-1, -2)
-                dQ_j = dS_j @ K_tile[:, :, j2:j2+kernel_size, :]
-                dQ[:, :, i+j:i+j+1, :] = dQ_j
+                # Process each element in the query tile.
+                x_iter_max = min(TILE_SIZE, Q_tile.shape[2])
+                y_iter_max = min(TILE_SIZE, Q_tile.shape[3])
+                for xi in range(0, x_iter_max):
+                    for yi in range(0, y_iter_max):
+                        xj = tile_start(x, xi, H, x_kv_start, kernel_size)
+                        yj = tile_start(y, yi, W, y_kv_start, kernel_size)
+                        Q_ij = Q_tile[:, :, xi:xi+1, yi:yi+1, :].view(B, N, 1, C)
+                        K_ij = K_tile[:, :, xj:xj+kernel_size, yj:yj+kernel_size, :].reshape(B, N, kernel_size**2, C)
+                        S_j = Q_ij @ K_ij.transpose(-1, -2)
+                        P_j = torch.softmax(S_j, dim=-1)
+                        P_j_jacobian = softmax_jacobian(P_j)
+                        dO_ij = dO_tile[:, :, xi:xi+1, yi:yi+1, :].view(B, N, 1, C)
+                        V_ij = V_tile[:, :, xj:xj+kernel_size, yj:yj+kernel_size, :].reshape(B, N, kernel_size**2, C)
+                        dP_j = dO_ij @ V_ij.transpose(-1, -2)
+                        dS_j = torch.matmul(P_j_jacobian, dP_j.transpose(-1, -2)).transpose(-1, -2)
+                        dQ_j = dS_j @ K_ij
+                        dQ[:, :, x+xi:x+xi+1, y+yi:y+yi+1, :] = dQ_j.view(B, N, 1, 1, C)
 
         # Just do the naive thing for dK and dV. Can add tiling later.
-        dK = torch.zeros(B, N, T, C)
-        dV = torch.zeros(B, N, T, C)
-        for i in range(T):
-            ni = get_backward_window_start(i, kernel_size)
-            ne = get_backward_window_end(i, T, kernel_size)
-            for xi in range(ni, ne):
-                oni = get_window_start(xi, T, kernel_size)
-                si = i - oni
+        dK = torch.zeros(B, N, H, W, C)
+        dV = torch.zeros(B, N, H, W, C)
+        for x in range(H):
+            xni = get_backward_window_start(x, kernel_size)
+            xne = get_backward_window_end(x, H, kernel_size)
+            for y in range(W):
+                yni = get_backward_window_start(y, kernel_size)
+                yne = get_backward_window_end(y, W, kernel_size)
+                for xi in range(xni, xne):
+                    xon = get_window_start(xi, H, kernel_size)
+                    for yi in range(yni, yne):
+                        yon = get_window_start(yi, W, kernel_size)
+                        xsi = x - xon
+                        ysi = y - yon
 
-                Q_slice = Q[:, :, xi, :]
-                S_xi = Q_slice.unsqueeze(2) @ K[:, :, oni:oni+kernel_size, :].transpose(-1, -2)
-                P_xi = torch.softmax(S_xi, dim=-1)
-                P_xi_jacobian = softmax_jacobian(P_xi)
-                dP_xi = dO[:, :, xi:xi+1, :] @ V[:, :, oni:oni+kernel_size, :].transpose(-1, -2)
-                dS_xi = torch.matmul(P_xi_jacobian, dP_xi.transpose(-1, -2)).transpose(-1, -2)
-                dS_slice = dS_xi[:, :, 0, si].unsqueeze(-1)
+                        Q_slice = Q[:, :, xi, yi, :]
+                        K_xiyi = K[:, :, xon:xon+kernel_size, yon:yon+kernel_size, :].reshape(B, N, kernel_size**2, C)
+                        V_xiyi = V[:, :, xon:xon+kernel_size, yon:yon+kernel_size, :].reshape(B, N, kernel_size**2, C)
+                        S_xi = Q_slice.unsqueeze(2) @ K_xiyi.transpose(-1, -2)
+                        P_xi = torch.softmax(S_xi, dim=-1)
+                        P_xi_jacobian = softmax_jacobian(P_xi)
+                        dP_xi = dO[:, :, xi, yi, :].unsqueeze(-2) @ V_xiyi.transpose(-1, -2)
+                        dS_xi = torch.matmul(P_xi_jacobian, dP_xi.transpose(-1, -2)).transpose(-1, -2)
 
-                dK[:, :, i, :] += Q_slice * dS_slice
-                dV[:, :, i, :] += P_xi[:, :, 0, si].unsqueeze(-1) * dO[:, :, xi, :]
+                        dS_xi = dS_xi.reshape(B, N, kernel_size, kernel_size)
+                        dS_slice = dS_xi[:, :, xsi, ysi].unsqueeze(-1)
+                        dK[:, :, x, y, :] += Q_slice * dS_slice
+
+                        P_xi = P_xi.reshape(B, N, kernel_size, kernel_size)
+                        dV[:, :, x, y, :] += P_xi[:, :, xsi, ysi].unsqueeze(-1) * dO[:, :, xi, yi, :]
 
         return dQ, dK, dV, None
 
