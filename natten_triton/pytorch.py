@@ -25,8 +25,8 @@ def get_backward_window_end(i, seq_len, kernel_size):
 def softmax_jacobian(x):
     B, H, T, C = x.shape
     jacobian = torch.zeros(B, H, C, C, dtype=x.dtype)
-    for b in range(2):
-        for h in range(3):  # Head dimension
+    for b in range(B):
+        for h in range(H):  # Head dimension
             # Extract the softmax vector for this batch and head
             xi = x[b, h, 0, :]
             diag_p = torch.diag(xi)
@@ -48,28 +48,24 @@ class Natten1d(torch.autograd.Function):
             softmax_scale: Softmax scale.
             kernel_size: Kernel size.
         """
-        B, H, T, C = q.shape
+        B, N, T, C = q.shape
         
         # Split q into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. The output of each tile is stored in o.
-        o = torch.zeros(B, H, 0, C)
+        o = torch.zeros(B, N, T, C)
         k_tile_size = TILE_SIZE + kernel_size - 1
-
-        # Debug variables, can be removed:
-        _p = torch.zeros(B, H, 0, kernel_size)
-        _qk = torch.zeros(B, H, 0, kernel_size)
 
         for i in range(0, T, TILE_SIZE):
             Q_tile = q[:, :, i:i+TILE_SIZE, :]
             kv_start = get_window_start(i, T, kernel_size)
+            iter_max = min(TILE_SIZE, Q_tile.shape[2])
             
             # Load k tile and allocate space for s. Load v tile as well to avoid stalling later.
             K_tile = k[:, :, kv_start:kv_start+k_tile_size, :]
             V_tile = v[:, :, kv_start:kv_start+k_tile_size, :]
-            P_tile = torch.zeros((B, H, 0, kernel_size))
+            P_tile = torch.zeros((B, N, iter_max, kernel_size))
             
             # For each element in the query tile, compute QK^T using the relevant slice of the key tile.
-            iter_max = min(TILE_SIZE, Q_tile.shape[2])
             for j in range(0, iter_max):
                 if i + j <= kernel_size // 2:
                     j2 = 0
@@ -80,9 +76,7 @@ class Natten1d(torch.autograd.Function):
 
                 S_j = Q_tile[:, :, j:j+1, :] @ K_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
                 P_j = torch.softmax(S_j, dim=-1)
-                P_tile = torch.cat((P_tile, P_j), dim=2)
-                _qk = torch.cat((_qk, S_j), dim=2)
-                _p = torch.cat((_p, P_j), dim=2)
+                P_tile[:, :, j:j+1, :] = P_j
 
             for j in range(0, iter_max):
                 if i + j <= kernel_size // 2:
@@ -92,7 +86,7 @@ class Natten1d(torch.autograd.Function):
                 else:
                     j2 = j
                 o_j = P_tile[:, :, j:j+1, :] @ V_tile[:, :, j2:j2+kernel_size, :]
-                o = torch.cat((o, o_j), dim=2)
+                o[:, :, i+j:i+j+1, :] = o_j
 
         ctx.save_for_backward(q, k, v, o)
         ctx.kernel_size = kernel_size
@@ -103,14 +97,14 @@ class Natten1d(torch.autograd.Function):
     def backward(ctx, grad_output):
         Q, K, V, _ = ctx.saved_tensors
         kernel_size = ctx.kernel_size
-        B, H, T, C = Q.shape
+        B, N, T, C = Q.shape
 
         dO = grad_output
 
         # dQ has the same neighborhood pattern, but dK and dV need us to invert the
         # neighborhood mapping, which is not symmetric. 
 
-        dQ = torch.zeros(B, H, 0, C)
+        dQ = torch.zeros(B, N, T, C)
         
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
@@ -140,12 +134,12 @@ class Natten1d(torch.autograd.Function):
                 dP_j = dO_tile[:, :, j:j+1, :] @ V_tile[:, :, j2:j2+kernel_size, :].transpose(-1, -2)
                 dS_j = torch.matmul(P_j_jacobian, dP_j.transpose(-1, -2)).transpose(-1, -2)
                 dQ_j = dS_j @ K_tile[:, :, j2:j2+kernel_size, :]
-                dQ = torch.cat((dQ, dQ_j), dim=2)
+                dQ[:, :, i+j:i+j+1, :] = dQ_j
 
 
         # Just do the naive thing for dK and dV. Can add tiling later.
-        dK = torch.zeros(B, H, T, C)
-        dV = torch.zeros(B, H, T, C)
+        dK = torch.zeros(B, N, T, C)
+        dV = torch.zeros(B, N, T, C)
         for i in range(T):
             ni = get_backward_window_start(i, kernel_size)
             ne = get_backward_window_end(i, T, kernel_size)
