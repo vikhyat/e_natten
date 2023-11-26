@@ -1,6 +1,6 @@
 import torch
 from natten.functional import natten1dqk, natten1dav
-from natten_triton import natten1d
+from natten_triton.pytorch import natten1d
 
 def test(input_shape, kernel_size):
     q, k, v = torch.randn(input_shape)
@@ -14,7 +14,6 @@ def test(input_shape, kernel_size):
     # natten
     s_1 = natten1dqk(q, k, kernel_size, 1)
     s_1.retain_grad()
-    print(s_1)
     p_1 = torch.softmax(s_1, dim=-1)
     p_1.retain_grad()
     o_1 = natten1dav(p_1, v, kernel_size, 1)

@@ -1,6 +1,6 @@
 import torch
 from torch.autograd import gradcheck
-from natten_triton import natten1d
+from natten_triton.pytorch import natten1d
 
 # Define an input tensor for gradcheck
 q, k, v = torch.randn((3, 2, 3, 8, 2), dtype=torch.double)
