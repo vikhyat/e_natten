@@ -1,8 +1,8 @@
 import torch
-from natten.functional import natten1dqk, natten1dav
-from natten_triton.pytorch import natten1d
+from natten.functional import natten1dqk, natten1dav, natten2dqk, natten2dav
+from natten_triton.pytorch import natten1d, natten2d
 
-def test(input_shape, kernel_size):
+def test(og_qk, og_av, new_fn, input_shape, kernel_size):
     q, k, v = torch.randn(input_shape)
     q = q.clone().requires_grad_(True)
     q.retain_grad()
@@ -12,11 +12,11 @@ def test(input_shape, kernel_size):
     v.retain_grad()
 
     # natten
-    s_1 = natten1dqk(q, k, kernel_size, 1)
+    s_1 = og_qk(q, k, kernel_size, 1)
     s_1.retain_grad()
     p_1 = torch.softmax(s_1, dim=-1)
     p_1.retain_grad()
-    o_1 = natten1dav(p_1, v, kernel_size, 1)
+    o_1 = og_av(p_1, v, kernel_size, 1)
 
     # natten_triton
     q_2 = q.detach().clone()
@@ -29,7 +29,7 @@ def test(input_shape, kernel_size):
     v_2.requires_grad = True
     v_2.retain_grad()
 
-    o_2 = natten1d(q_2, k_2, v_2, kernel_size)
+    o_2 = new_fn(q_2, k_2, v_2, kernel_size)
 
     print('Forward pass:', torch.allclose(o_1, o_2, atol=1e-5))
 
@@ -44,4 +44,6 @@ def test(input_shape, kernel_size):
 
 if __name__ == '__main__':
     print('# 1D attention')
-    test((3, 2, 3, 4, 2), 3)
+    test(natten1dqk, natten1dav, natten1d, (3, 2, 3, 8, 2), 5)
+    print('# 2D attention')
+    test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
