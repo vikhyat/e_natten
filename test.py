@@ -1,7 +1,6 @@
 import torch
 from natten.functional import natten1dqk, natten1dav
 from natten_triton import natten1d
-from test2 import custom_av
 
 if __name__ == '__main__':
     ## 1D attention test
@@ -12,6 +11,8 @@ if __name__ == '__main__':
     q.retain_grad()
     k = k.clone().requires_grad_(True)
     k.retain_grad()
+    v = v.clone().requires_grad_(True)
+    v.retain_grad()
 
     # natten
     s_1 = natten1dqk(q, k, kernel_size, 1)
@@ -28,6 +29,8 @@ if __name__ == '__main__':
     k_2.requires_grad = True
     k_2.retain_grad()
     v_2 = v.detach().clone()
+    v_2.requires_grad = True
+    v_2.retain_grad()
 
     o_2 = natten1d(q_2, k_2, v_2, kernel_size)
 
@@ -40,3 +43,4 @@ if __name__ == '__main__':
     loss_2.backward()
     print('1D backward pass (Q):', torch.allclose(q.grad, q_2.grad, atol=1e-5))
     print('1D backward pass (K):', torch.allclose(k.grad, k_2.grad, atol=1e-5))
+    print('1D backward pass (V):', torch.allclose(v.grad, v_2.grad, atol=1e-5))

@@ -141,6 +141,7 @@ class Natten1d(torch.autograd.Function):
 
         # Just do the naive thing for dK and dV. Can add tiling later.
         dK = torch.zeros(B, H, T, C)
+        dV = torch.zeros(B, H, T, C)
         for i in range(T):
             ni = get_backward_window_start(i, kernel_size)
             ne = get_backward_window_end(i, T, kernel_size)
@@ -157,7 +158,8 @@ class Natten1d(torch.autograd.Function):
                 dS_slice = dS_xi[:, :, 0, si].unsqueeze(-1)
 
                 dK[:, :, i, :] += Q_slice * dS_slice
+                dV[:, :, i, :] += P_xi[:, :, 0, si].unsqueeze(-1) * dO[:, :, xi, :]
 
-        return dQ, dK, dQ, None
+        return dQ, dK, dV, None
 
 natten1d = Natten1d.apply
