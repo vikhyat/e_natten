@@ -1,6 +1,6 @@
 import torch
 
-Q_TILE_SIZE = 3
+TILE_SIZE = 3
 
 def get_window_start(i, seq_len, kernel_size):
     start = max(i - kernel_size // 2, 0)
@@ -51,12 +51,14 @@ class Natten1d(torch.autograd.Function):
         # Split q into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. The output of each tile is stored in o.
         o = torch.zeros(B, H, 0, C)
-        k_tile_size = Q_TILE_SIZE + kernel_size - 1
+        k_tile_size = TILE_SIZE + kernel_size - 1
+
+        # Debug variables, can be removed:
         _p = torch.zeros(B, H, 0, kernel_size)
         _qk = torch.zeros(B, H, 0, kernel_size)
 
-        for i in range(0, T, Q_TILE_SIZE):
-            Q_tile = q[:, :, i:i+Q_TILE_SIZE, :]
+        for i in range(0, T, TILE_SIZE):
+            Q_tile = q[:, :, i:i+TILE_SIZE, :]
             kv_start = get_window_start(i, T, kernel_size)
             
             # Load k tile and allocate space for s. Load v tile as well to avoid stalling later.
@@ -65,9 +67,9 @@ class Natten1d(torch.autograd.Function):
             P_tile = torch.zeros((B, H, 0, kernel_size))
             
             # For each element in the query tile, compute QK^T using the relevant slice of the key tile.
-            iter_max = min(Q_TILE_SIZE, Q_tile.shape[2])
+            iter_max = min(TILE_SIZE, Q_tile.shape[2])
             for j in range(0, iter_max):
-                if i <= kernel_size // 2:
+                if i + j <= kernel_size // 2:
                     j2 = 0
                 elif i + j >= T - kernel_size // 2 - 1:
                     j2 = T - kv_start - kernel_size
@@ -81,7 +83,7 @@ class Natten1d(torch.autograd.Function):
                 _p = torch.cat((_p, P_j), dim=2)
 
             for j in range(0, iter_max):
-                if i <= kernel_size // 2:
+                if i + j <= kernel_size // 2:
                     j2 = 0
                 elif i + j >= T - kernel_size // 2 - 1:
                     j2 = T - kv_start - kernel_size
@@ -110,10 +112,10 @@ class Natten1d(torch.autograd.Function):
         
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
-        k_tile_size = Q_TILE_SIZE + kernel_size - 1
-        for i in range(0, T, Q_TILE_SIZE):
-            dO_tile = dO[:, :, i:i+Q_TILE_SIZE, :]
-            Q_tile = Q[:, :, i:i+Q_TILE_SIZE, :]
+        k_tile_size = TILE_SIZE + kernel_size - 1
+        for i in range(0, T, TILE_SIZE):
+            dO_tile = dO[:, :, i:i+TILE_SIZE, :]
+            Q_tile = Q[:, :, i:i+TILE_SIZE, :]
 
             # Load k tile.
             kv_start = get_window_start(i, T, kernel_size)
@@ -121,9 +123,9 @@ class Natten1d(torch.autograd.Function):
             V_tile = V[:, :, kv_start:kv_start+k_tile_size, :]
 
             # Process each element in the query tile.
-            iter_max = min(Q_TILE_SIZE, Q_tile.shape[2])
+            iter_max = min(TILE_SIZE, Q_tile.shape[2])
             for j in range(0, iter_max):
-                if i <= kernel_size // 2:
+                if i + j <= kernel_size // 2:
                     j2 = 0
                 elif i + j >= T - kernel_size // 2 - 1:
                     j2 = T - kv_start - kernel_size

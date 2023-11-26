@@ -12,5 +12,5 @@ v = v.clone().requires_grad_(True)
 v.retain_grad()
 
 # Use gradcheck to verify the gradients of natten1d
-gradcheck_result = gradcheck(natten1d, (q, k, v, 5), eps=1e-6, atol=1e-4)
+gradcheck_result = gradcheck(natten1d, (q, k, v, 7), eps=1e-6, atol=1e-4)
 print("Gradient check result:", gradcheck_result)
