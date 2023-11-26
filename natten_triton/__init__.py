@@ -90,14 +90,14 @@ class Natten1d(torch.autograd.Function):
                 o_j = P_tile[:, :, j:j+1, :] @ V_tile[:, :, j2:j2+kernel_size, :]
                 o = torch.cat((o, o_j), dim=2)
 
-        ctx.save_for_backward(q, k, v, _p)
+        ctx.save_for_backward(q, k, v, o)
         ctx.kernel_size = kernel_size
 
         return o
 
     @staticmethod
     def backward(ctx, grad_output):
-        Q, K, V, O = ctx.saved_tensors
+        Q, K, V, _ = ctx.saved_tensors
         kernel_size = ctx.kernel_size
         B, H, T, C = Q.shape
 
