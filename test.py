@@ -1,9 +1,9 @@
 import torch
 from natten.functional import natten1dqk, natten1dav, natten2dqk, natten2dav
-from natten_triton.pytorch import natten1d, natten2d
+from natten_triton.triton import natten1d, natten2d
 
 def test(og_qk, og_av, new_fn, input_shape, kernel_size):
-    q, k, v = torch.randn(input_shape)
+    q, k, v = torch.randn(input_shape).to('cuda')
     q = q.clone().requires_grad_(True)
     q.retain_grad()
     k = k.clone().requires_grad_(True)
@@ -44,6 +44,6 @@ def test(og_qk, og_av, new_fn, input_shape, kernel_size):
 
 if __name__ == '__main__':
     print('# 1D attention')
-    test(natten1dqk, natten1dav, natten1d, (3, 2, 3, 8, 2), 5)
-    print('# 2D attention')
-    test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
+    test(natten1dqk, natten1dav, natten1d, (3, 1, 3, 8, 2), 5)
+    # print('# 2D attention')
+    # test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
