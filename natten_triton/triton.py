@@ -57,81 +57,68 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
                  stride_kb, stride_kn, stride_kt, stride_kc,
                  stride_vb, stride_vn, stride_vt, stride_vc,
                  stride_ob, stride_on, stride_ot, stride_oc,
-                 TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr,
+                 K_TILE_SIZE: tl.constexpr,
                  B: tl.constexpr, N: tl.constexpr, T: tl.constexpr, C: tl.constexpr):
 
     bn_offset = tl.program_id(0)
-    qtile_offset = tl.program_id(1)
-    
+    t_offset = tl.program_id(1)
     b_offset = bn_offset // N
     n_offset = bn_offset % N
     qkv_offset = b_offset * stride_qb + n_offset * stride_qn
-    kv_start = triton_window_start(qtile_offset * TILE_SIZE, T, kernel_size)
+    kv_start = triton_window_start(t_offset, T, kernel_size)
     
-    Q_block_ptr = tl.make_block_ptr(
+    q = tl.load(tl.make_block_ptr(
         base=Q + qkv_offset,
         shape=(T, C),
         strides=(stride_qt, stride_qc),
-        offsets=(qtile_offset * TILE_SIZE, 0),
+        offsets=(t_offset, 0),
         block_shape=(1, C),
         order=(1, 0)
-    )
-    K_block_ptr = tl.make_block_ptr(
+    ))
+    k = tl.load(tl.make_block_ptr(
         base=K + qkv_offset,
         shape=(T, C),
         strides=(stride_kt, stride_kc),
         offsets=(kv_start, 0),
         block_shape=(K_TILE_SIZE, C),
         order=(1, 0)
-    )
-    V_block_ptr = tl.make_block_ptr(
+    ))
+    v = tl.load(tl.make_block_ptr(
         base=V + qkv_offset,
         shape=(T, C),
         strides=(stride_vt, stride_vc),
         offsets=(kv_start, 0),
         block_shape=(K_TILE_SIZE, C),
         order=(1, 0)
-    )
+    ))
+    k_idx_range = tl.arange(0, K_TILE_SIZE)
+    mask1 = k_idx_range < kernel_size
+    mask2 = k_idx_range[:, None] < kernel_size
+
+    # Compute QK^T.
+    k = tl.where(mask2, k, 0)
+    S_j = tl.sum(q * k, 1)
+
+    # Compute softmax.
+    S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
+    numerator = tl.where(mask1, tl.exp(S_j_minus_max), 0)
+    denominator = tl.sum(numerator, axis=0)
+    P_j = numerator / denominator
+
+    # Compute output.
+    v = tl.where(mask2, v, 0)
+    o_j = tl.sum(P_j[:, None] * v, 0)
+
+    # Save output.
     O_block_ptr = tl.make_block_ptr(
         base=Out + qkv_offset,
         shape=(T, C),
         strides=(stride_ot, stride_oc),
-        offsets=(qtile_offset * TILE_SIZE, 0),
+        offsets=(t_offset, 0),
         block_shape=(1, C),
         order=(1, 0)
     )
-    k_idx_range = tl.arange(0, K_TILE_SIZE)
-
-    # Load Q, K, and V into SRAM.
-    # Q_tile = tl.load(Q_block_ptr, boundary_check=(0))
-    # K_tile = tl.load(K_block_ptr)
-    # V_tile = tl.load(V_block_ptr)
-
-    for i in range(0, TILE_SIZE):
-        q = tl.load(tl.advance(Q_block_ptr, (i, 0)))
-        start = triton_window_start(qtile_offset * TILE_SIZE + i, T, kernel_size) - kv_start
-
-        mask1 = k_idx_range < kernel_size
-        mask2 = k_idx_range[:, None] < kernel_size
-
-        # Compute QK^T.
-        k = tl.load(tl.advance(K_block_ptr, (start, 0)))
-        k = tl.where(mask2, k, 0)
-        S_j = tl.sum(q * k, 1)
-
-        # Compute softmax.
-        S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
-        numerator = tl.where(mask1, tl.exp(S_j_minus_max), 0)
-        denominator = tl.sum(numerator, axis=0)
-        P_j = numerator / denominator
-
-        # Compute output.
-        v = tl.load(tl.advance(V_block_ptr, (start, 0)))
-        v = tl.where(mask2, v, 0)
-        o_j = tl.sum(P_j[:, None] * v, 0)
-
-        # Save output.
-        tl.store(tl.advance(O_block_ptr, (i, 0)), o_j[None, :], boundary_check=(0, 1))
+    tl.store(O_block_ptr, o_j[None, :], boundary_check=(0, 1))
 
 class Natten1d(torch.autograd.Function):
     @staticmethod
@@ -148,15 +135,14 @@ class Natten1d(torch.autograd.Function):
         """
         B, N, T, C = q.shape
         o = torch.zeros_like(q)
-        tile_size = 3
         k_tile_size = (1 + (TILE_SIZE + kernel_size - 1) // 2) * 2
-        grid = (B*N, triton.cdiv(T, TILE_SIZE))
+        grid = (B*N, T)
         _attn_fwd_1d[grid](q, k, v, kernel_size, o,
                             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
                             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                            tile_size, k_tile_size, B, N, T, C)
+                            8, B, N, T, C)
         
         ctx.save_for_backward(q, k, v, o)
         ctx.kernel_size = kernel_size
@@ -249,7 +235,7 @@ class Natten2d(torch.autograd.Function):
         
         # Split q into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. The output of each tile is stored in o.
-        o = torch.zeros(B, N, H, W, C)
+        o = torch.zeros_like(q)
         k_tile_size = TILE_SIZE + kernel_size - 1
 
         for x in range(0, H, TILE_SIZE):
@@ -294,7 +280,7 @@ class Natten2d(torch.autograd.Function):
         # dQ has the same neighborhood pattern, but dK and dV need us to invert the
         # neighborhood mapping, which is not symmetric. 
 
-        dQ = torch.zeros(B, N, H, W, C)
+        dQ = torch.zeros_like(Q)
         
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
@@ -331,8 +317,8 @@ class Natten2d(torch.autograd.Function):
                         dQ[:, :, x+xi:x+xi+1, y+yi:y+yi+1, :] = dQ_j.view(B, N, 1, 1, C)
 
         # Just do the naive thing for dK and dV. Can add tiling later.
-        dK = torch.zeros(B, N, H, W, C)
-        dV = torch.zeros(B, N, H, W, C)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
         for x in range(H):
             xni = get_backward_window_start(x, kernel_size)
             xne = get_backward_window_end(x, H, kernel_size)

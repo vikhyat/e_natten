@@ -45,5 +45,5 @@ def test(og_qk, og_av, new_fn, input_shape, kernel_size):
 if __name__ == '__main__':
     print('# 1D attention')
     test(natten1dqk, natten1dav, natten1d, (3, 1, 3, 8, 2), 5)
-    # print('# 2D attention')
-    # test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
+    print('# 2D attention')
+    test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
