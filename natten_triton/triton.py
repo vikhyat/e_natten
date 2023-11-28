@@ -198,13 +198,16 @@ class Natten1d(torch.autograd.Function):
         B, N, T, C = q.shape
         o = torch.zeros_like(q)
 
+        # Calculate next highest power of two greater than kernel_size
+        k_tile_size = 2 ** (kernel_size - 1).bit_length()
+
         grid = (B*N, T)
         _attn_fwd_1d[grid](q, k, v, kernel_size, o,
                             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
                             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                            8, B, N, T, C)
+                            k_tile_size, B, N, T, C)
         
         ctx.save_for_backward(q, k, v, o)
         ctx.kernel_size = kernel_size
@@ -296,7 +299,9 @@ class Natten2d(torch.autograd.Function):
         B, N, H, W, C = Q.shape
         
         o = torch.zeros_like(Q)
-        k_tile_size = 4
+
+        # Calculate next highest power of two greater than kernel_size
+        k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
         grid = (B*N, H*W)
         _attn_fwd_2d[grid](Q, K, V, kernel_size, o,

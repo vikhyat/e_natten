@@ -50,4 +50,4 @@ if __name__ == '__main__':
     test(natten1dqk, natten1dav, natten1d, (3, 1, 3, 8, 2), 5)
 
     print('# 2D attention')
-    test(natten2dqk, natten2dav, natten2d, (3, 1, 1, 4, 4, 2), 3)
+    test(natten2dqk, natten2dav, natten2d, (3, 2, 6, 8, 8, 2), 7)
