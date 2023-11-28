@@ -120,18 +120,21 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
     tl.store(O_block_ptr, o_j[None, :], boundary_check=(0, 1))
 
 @triton.jit
-def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK,
+def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
                     stride_qb, stride_qn, stride_qt, stride_qc,
                     stride_kb, stride_kn, stride_kt, stride_kc,
                     stride_vb, stride_vn, stride_vt, stride_vc,
                     stride_dob, stride_don, stride_dot, stride_doc,
                     stride_dqb, stride_dqn, stride_dqt, stride_dqc,
                     stride_dkb, stride_dkn, stride_dkt, stride_dkc,
+                    stride_dvb, stride_dvn, stride_dvt, stride_dvc,
                     K_TILE_SIZE: tl.constexpr, B: tl.constexpr,
                     N: tl.constexpr, T: tl.constexpr, C: tl.constexpr):
 
-    assert stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb and stride_dqb == stride_qb and stride_dkb == stride_qb
-    assert stride_kn == stride_qn and stride_vn == stride_qn and stride_don == stride_qn and stride_dqn == stride_qn and stride_dkn == stride_qn
+    assert (stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb
+            and stride_dqb == stride_qb and stride_dkb == stride_qb and stride_dvb == stride_qb)
+    assert (stride_kn == stride_qn and stride_vn == stride_qn and stride_don == stride_qn
+            and stride_dqn == stride_qn and stride_dkn == stride_qn and stride_dvn == stride_qn)
 
     bn_offset = tl.program_id(0)
     t_offset = tl.program_id(1)
@@ -190,6 +193,12 @@ def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK,
     dK_update = dK_update.to(dK.dtype.element_ty)
     dK_update_ptr = dK + qkv_offset + kv_start * stride_dkt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dkt + tl.arange(0, C) * stride_dkc
     tl.atomic_add(dK_update_ptr, dK_update)
+
+    # Update dV.
+    dV_update = P_j[:, None] * do
+    dV_update = dV_update.to(dV.dtype.element_ty)
+    dV_update_ptr = dV + qkv_offset + kv_start * stride_dvt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvt + tl.arange(0, C) * stride_dvc
+    tl.atomic_add(dV_update_ptr, dV_update)
 
 @triton.jit
 def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out, 
@@ -394,33 +403,16 @@ class Natten1d(torch.autograd.Function):
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
         grid = (B*N, T)
-        _attn_bwd_1d[grid](Q, K, V, kernel_size, dO, dQ, dK,
+        _attn_bwd_1d[grid](Q, K, V, kernel_size, dO, dQ, dK, dV,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                             V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                             dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3),
                             dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3),
                             dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3),
+                            dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3),
                             k_tile_size, B, N, T, C)
         
-        # Just do the naive thing for dK and dV. Can add tiling later.
-        for i in range(T):
-            ni = get_backward_window_start(i, kernel_size)
-            ne = get_backward_window_end(i, T, kernel_size)
-            for xi in range(ni, ne):
-                oni = get_window_start(xi, T, kernel_size)
-                si = i - oni
-
-                Q_slice = Q[:, :, xi, :]
-                S_xi = Q_slice.unsqueeze(2) @ K[:, :, oni:oni+kernel_size, :].transpose(-1, -2)
-                P_xi = torch.softmax(S_xi, dim=-1)
-                P_xi_jacobian = softmax_jacobian(P_xi)
-                dP_xi = dO[:, :, xi:xi+1, :] @ V[:, :, oni:oni+kernel_size, :].transpose(-1, -2)
-                dS_xi = torch.matmul(P_xi_jacobian, dP_xi.transpose(-1, -2)).transpose(-1, -2)
-                dS_slice = dS_xi[:, :, 0, si].unsqueeze(-1)
-
-                dV[:, :, i, :] += P_xi[:, :, 0, si].unsqueeze(-1) * dO[:, :, xi, :]
-
         return dQ, dK, dV, None
 
 natten1d = Natten1d.apply
