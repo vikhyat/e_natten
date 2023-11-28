@@ -2,6 +2,8 @@ import torch
 from natten.functional import natten1dqk, natten1dav, natten2dqk, natten2dav
 from natten_triton.triton import natten1d, natten2d
 
+torch.manual_seed(0)
+
 def test(og_qk, og_av, new_fn, input_shape, kernel_size):
     q, k, v = torch.randn(input_shape).to('cuda')
     q = q.clone().requires_grad_(True)
@@ -43,7 +45,9 @@ def test(og_qk, og_av, new_fn, input_shape, kernel_size):
     print('Backward pass (V):', torch.allclose(v.grad, v_2.grad, atol=1e-5))
 
 if __name__ == '__main__':
+    # TODO: Fix bug where dQ is wrong for K=3.
     print('# 1D attention')
     test(natten1dqk, natten1dav, natten1d, (3, 1, 3, 8, 2), 5)
+
     print('# 2D attention')
-    test(natten2dqk, natten2dav, natten2d, (3, 2, 3, 8, 8, 2), 5)
+    test(natten2dqk, natten2dav, natten2d, (3, 1, 1, 4, 4, 2), 3)

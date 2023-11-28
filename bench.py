@@ -5,13 +5,13 @@ from natten.functional import natten1dqk, natten1dav
 
 configs = []
 configs.append(triton.testing.Benchmark(
-    x_names=['T'],
+    x_names=['Sequence Length'],
     x_vals=[2**i for i in range(8, 16)],
     line_arg="provider",
     line_vals=['triton', 'natten'],
-    line_names=['Triton', 'Natten'],
+    line_names=['Natten (triton)', 'Natten (original)'],
     ylabel='time (ms)',
-    args={'B': 1, 'N': 1, 'C': 64, 'kernel_size': 5},
+    args={'B': 4, 'N': 12, 'C': 1024, 'kernel_size': 5},
     plot_name=f"1d-fwd",
 ))
 
