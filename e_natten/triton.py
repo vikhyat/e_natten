@@ -221,17 +221,6 @@ def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
     dV_update_ptr = dV + qkv_offset + kv_start * stride_dvt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvt + tl.arange(0, C) * stride_dvc
     tl.atomic_add(dV_update_ptr, dV_update)
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["B", "N", "H", "W", "C", "kernel_size"],
-)
 @triton.jit
 def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out, 
                  stride_qb, stride_qn, stride_qh, stride_qw, stride_qc,
@@ -330,11 +319,10 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
             and stride_dqn == stride_qn and stride_dkn == stride_qn and stride_dvn == stride_qn)
     
     bn_offset = tl.program_id(0)
-    hw_offset = tl.program_id(1)
+    h_offset = tl.program_id(1)
+    w_offset = tl.program_id(2)
     b_offset = bn_offset // N
     n_offset = bn_offset % N
-    h_offset = hw_offset // W
-    w_offset = hw_offset % W
     qkv_offset = b_offset * stride_qb + n_offset * stride_qn
     kv_start_x = triton_window_start(h_offset, H, kernel_size)
     kv_start_y = triton_window_start(w_offset, W, kernel_size)
@@ -368,7 +356,7 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
         offsets=(kv_start_x, kv_start_y, 0),
         block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
         order=(2, 1, 0)
-    ))
+    ), boundary_check=(0, 1, 2))
     v = tl.load(tl.make_block_ptr(
         base=V + qkv_offset,
         shape=(H, W, C),
@@ -376,7 +364,7 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
         offsets=(kv_start_x, kv_start_y, 0),
         block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
         order=(2, 1, 0)
-    ))
+    ), boundary_check=(0, 1, 2))
 
     mask = tl.arange(0, K_TILE_SIZE)
     mask = tl.where(mask < kernel_size, 1, 0)
@@ -537,7 +525,7 @@ class Natten2d(torch.autograd.Function):
         # Calculate next highest power of two greater than kernel_size
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
-        grid = (B*N, H*W)
+        grid = (B*N, H, W)
         _attn_bwd_2d[grid](Q, K, V, kernel_size, dO, dQ, dK, dV,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3), Q.stride(4),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3), K.stride(4),
