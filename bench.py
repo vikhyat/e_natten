@@ -1,6 +1,6 @@
 import torch
 import triton
-from natten_triton.triton import natten1d
+from e_natten import natten1d
 from natten.functional import natten1dqk, natten1dav
 
 configs = []

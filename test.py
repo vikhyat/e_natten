@@ -1,6 +1,6 @@
 import torch
 from natten.functional import natten1dqk, natten1dav, natten2dqk, natten2dav
-from natten_triton.triton import natten1d, natten2d
+from e_natten import natten1d, natten2d
 
 torch.manual_seed(0)
 
@@ -45,8 +45,9 @@ def test(og_qk, og_av, new_fn, input_shape, kernel_size):
     print('Backward pass (V):', torch.allclose(v.grad, v_2.grad, atol=1e-5))
 
 if __name__ == '__main__':
-    print('# 1D attention')
-    test(natten1dqk, natten1dav, natten1d, (3, 2, 3, 16, 2), 15)
-
-    print('# 2D attention')
-    test(natten2dqk, natten2dav, natten2d, (3, 2, 6, 8, 8, 2), 7)
+    for kernel_size in [3, 5, 7, 9, 11]:
+        print('# Kernel size: ', kernel_size)
+        print('## 1D attention')
+        test(natten1dqk, natten1dav, natten1d, (3, 2, 3, 16, 2), kernel_size)
+        print('## 2D attention')
+        test(natten2dqk, natten2dav, natten2d, (3, 2, 6, 16, 16, 2), kernel_size)

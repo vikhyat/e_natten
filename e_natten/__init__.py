@@ -1,0 +1,1 @@
+from .triton import natten1d, natten2d
