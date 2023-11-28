@@ -276,14 +276,21 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     tl.store(O_block_ptr, o_ij[None, None, :], boundary_check=(0, 1, 2))
 
 @triton.jit
-def _attn_bwd_2d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
+def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
                     stride_qb, stride_qn, stride_qh, stride_qw, stride_qc,
                     stride_kb, stride_kn, stride_kh, stride_kw, stride_kc,
                     stride_vb, stride_vn, stride_vh, stride_vw, stride_vc,
                     stride_dob, stride_don, stride_doh, stride_dow, stride_doc,
                     stride_dqb, stride_dqn, stride_dqh, stride_dqw, stride_dqc,
+                    stride_dkb, stride_dkn, stride_dkh, stride_dkw, stride_dkc,
+                    stride_dvb, stride_dvn, stride_dvh, stride_dvw, stride_dvc,
                     K_TILE_SIZE: tl.constexpr, B: tl.constexpr, N: tl.constexpr,
                     H: tl.constexpr, W: tl.constexpr, C: tl.constexpr):
+    
+    assert (stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb
+            and stride_dqb == stride_qb and stride_dkb == stride_qb and stride_dvb == stride_qb)
+    assert (stride_kn == stride_qn and stride_vn == stride_qn and stride_don == stride_qn
+            and stride_dqn == stride_qn and stride_dkn == stride_qn and stride_dvn == stride_qn)
     
     bn_offset = tl.program_id(0)
     hw_offset = tl.program_id(1)
@@ -344,7 +351,7 @@ def _attn_bwd_2d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
     dS_ij = tl.reshape(dS_ij, (K_TILE_SIZE**2, 1))
     dQ_ij = tl.sum(dS_ij * k, 0)
     
-    # Save dQ
+    # Save dQ.
     dQ_block_ptr = tl.make_block_ptr(
         base=dQ + qkv_offset,
         shape=(H, W, C),
@@ -354,6 +361,20 @@ def _attn_bwd_2d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
         order=(2, 1, 0)
     )
     tl.store(dQ_block_ptr, dQ_ij[None, None, :], boundary_check=(0, 1, 2))
+    
+    # Update dK.
+    dK_update = q * dS_ij[:, None]
+    dK_update = dK_update.to(dK.dtype.element_ty)
+    dK_update = tl.reshape(dK_update, (K_TILE_SIZE, K_TILE_SIZE, C))
+    dK_update_ptr = dK + qkv_offset + kv_start_x * stride_dkh + kv_start_y * stride_dkw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dkh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dkw + tl.arange(0, C) * stride_dkc
+    tl.atomic_add(dK_update_ptr, dK_update)
+
+    # Update dV.
+    P_ij = tl.reshape(P_ij, (K_TILE_SIZE, K_TILE_SIZE, 1))
+    dV_update = P_ij * do[None, :]
+    dV_update = dV_update.to(dV.dtype.element_ty)
+    dV_update_ptr = dV + qkv_offset + kv_start_x * stride_dvh + kv_start_y * stride_dvw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dvh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvw + tl.arange(0, C) * stride_dvc
+    tl.atomic_add(dV_update_ptr, dV_update)
 
 class Natten1d(torch.autograd.Function):
     @staticmethod
@@ -466,44 +487,16 @@ class Natten2d(torch.autograd.Function):
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
         grid = (B*N, H*W)
-        _attn_bwd_2d_dq[grid](Q, K, V, kernel_size, dO, dQ,
+        _attn_bwd_2d[grid](Q, K, V, kernel_size, dO, dQ, dK, dV,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3), Q.stride(4),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3), K.stride(4),
                             V.stride(0), V.stride(1), V.stride(2), V.stride(3), V.stride(4),
                             dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3), dO.stride(4),
                             dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3), dQ.stride(4),
+                            dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3), dK.stride(4),
+                            dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3), dV.stride(4),
                             k_tile_size, B, N, H, W, C)
         
-        # Just do the naive thing for dK and dV. Can add tiling later.
-        for x in range(H):
-            xni = get_backward_window_start(x, kernel_size)
-            xne = get_backward_window_end(x, H, kernel_size)
-            for y in range(W):
-                yni = get_backward_window_start(y, kernel_size)
-                yne = get_backward_window_end(y, W, kernel_size)
-                for xi in range(xni, xne):
-                    xon = get_window_start(xi, H, kernel_size)
-                    for yi in range(yni, yne):
-                        yon = get_window_start(yi, W, kernel_size)
-                        xsi = x - xon
-                        ysi = y - yon
-
-                        Q_slice = Q[:, :, xi, yi, :]
-                        K_xiyi = K[:, :, xon:xon+kernel_size, yon:yon+kernel_size, :].reshape(B, N, kernel_size**2, C)
-                        V_xiyi = V[:, :, xon:xon+kernel_size, yon:yon+kernel_size, :].reshape(B, N, kernel_size**2, C)
-                        S_xi = Q_slice.unsqueeze(2) @ K_xiyi.transpose(-1, -2)
-                        P_xi = torch.softmax(S_xi, dim=-1)
-                        P_xi_jacobian = softmax_jacobian(P_xi)
-                        dP_xi = dO[:, :, xi, yi, :].unsqueeze(-2) @ V_xiyi.transpose(-1, -2)
-                        dS_xi = torch.matmul(P_xi_jacobian, dP_xi.transpose(-1, -2)).transpose(-1, -2)
-
-                        dS_xi = dS_xi.reshape(B, N, kernel_size, kernel_size)
-                        dS_slice = dS_xi[:, :, xsi, ysi].unsqueeze(-1)
-                        dK[:, :, x, y, :] += Q_slice * dS_slice
-
-                        P_xi = P_xi.reshape(B, N, kernel_size, kernel_size)
-                        dV[:, :, x, y, :] += P_xi[:, :, xsi, ysi].unsqueeze(-1) * dO[:, :, xi, yi, :]
-
         return dQ, dK, dV, None
 
 natten2d = Natten2d.apply
