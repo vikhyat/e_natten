@@ -45,7 +45,6 @@ def test(og_qk, og_av, new_fn, input_shape, kernel_size):
     print('Backward pass (V):', torch.allclose(v.grad, v_2.grad, atol=1e-5))
 
 if __name__ == '__main__':
-    # TODO: Fix bug where dQ is wrong for K=3.
     print('# 1D attention')
     test(natten1dqk, natten1dav, natten1d, (3, 2, 3, 16, 2), 15)
 

@@ -120,17 +120,18 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
     tl.store(O_block_ptr, o_j[None, :], boundary_check=(0, 1))
 
 @triton.jit
-def _attn_bwd_1d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
+def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK,
                     stride_qb, stride_qn, stride_qt, stride_qc,
                     stride_kb, stride_kn, stride_kt, stride_kc,
                     stride_vb, stride_vn, stride_vt, stride_vc,
                     stride_dob, stride_don, stride_dot, stride_doc,
                     stride_dqb, stride_dqn, stride_dqt, stride_dqc,
+                    stride_dkb, stride_dkn, stride_dkt, stride_dkc,
                     K_TILE_SIZE: tl.constexpr, B: tl.constexpr,
                     N: tl.constexpr, T: tl.constexpr, C: tl.constexpr):
 
-    assert stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb and stride_dqb == stride_qb
-    assert stride_kn == stride_qn and stride_vn == stride_qn and stride_don == stride_qn and stride_dqn == stride_qn
+    assert stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb and stride_dqb == stride_qb and stride_dkb == stride_qb
+    assert stride_kn == stride_qn and stride_vn == stride_qn and stride_don == stride_qn and stride_dqn == stride_qn and stride_dkn == stride_qn
 
     bn_offset = tl.program_id(0)
     t_offset = tl.program_id(1)
@@ -173,7 +174,7 @@ def _attn_bwd_1d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
     dS_j = tl.sum(Jac_P_j * dP_j, 1)
     dQ_j = tl.sum(dS_j[:, None] * k, 0)
 
-    # Save output.
+    # Save dQ.
     dQ_block_ptr = tl.make_block_ptr(
         base=dQ + qkv_offset,
         shape=(T, C),
@@ -183,6 +184,12 @@ def _attn_bwd_1d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
         order=(1, 0)
     )
     tl.store(dQ_block_ptr, dQ_j[None, :], boundary_check=(0, 1))
+
+    # Update dK.
+    dK_update = q * dS_j[:, None]
+    dK_update = dK_update.to(dK.dtype.element_ty)
+    dK_update_ptr = dK + qkv_offset + kv_start * stride_dkt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dkt + tl.arange(0, C) * stride_dkc
+    tl.atomic_add(dK_update_ptr, dK_update)
 
 @triton.jit
 def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out, 
@@ -387,12 +394,13 @@ class Natten1d(torch.autograd.Function):
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
         grid = (B*N, T)
-        _attn_bwd_1d_dq[grid](Q, K, V, kernel_size, dO, dQ,
+        _attn_bwd_1d[grid](Q, K, V, kernel_size, dO, dQ, dK,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                             V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                             dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3),
                             dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3),
+                            dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3),
                             k_tile_size, B, N, T, C)
         
         # Just do the naive thing for dK and dV. Can add tiling later.
@@ -411,7 +419,6 @@ class Natten1d(torch.autograd.Function):
                 dS_xi = torch.matmul(P_xi_jacobian, dP_xi.transpose(-1, -2)).transpose(-1, -2)
                 dS_slice = dS_xi[:, :, 0, si].unsqueeze(-1)
 
-                dK[:, :, i, :] += Q_slice * dS_slice
                 dV[:, :, i, :] += P_xi[:, :, 0, si].unsqueeze(-1) * dO[:, :, xi, :]
 
         return dQ, dK, dV, None
