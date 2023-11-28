@@ -122,7 +122,7 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
 
     # Compute softmax.
     S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
-    numerator = tl.where(mask, tl.math.exp2(S_j_minus_max), 0)
+    numerator = tl.where(mask, tl.exp(S_j_minus_max), 0)
     denominator = tl.sum(numerator, axis=0)
     P_j = numerator / denominator
 
@@ -189,7 +189,7 @@ def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
 
     # Compute softmax.
     S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
-    numerator = tl.where(mask, tl.math.exp2(S_j_minus_max), 0)
+    numerator = tl.where(mask, tl.exp(S_j_minus_max), 0)
     denominator = tl.sum(numerator, axis=0)
     P_j = numerator / denominator
 
@@ -292,7 +292,7 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
 
     # Compute softmax.
     S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
-    numerator = tl.math.exp2(S_ij_minus_max) * mask2.to(S_ij.dtype)
+    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
     denominator = tl.sum(numerator, axis=1)
     P_ij = numerator / denominator
     
@@ -392,7 +392,7 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
 
     # Compute softmax.
     S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
-    numerator = tl.math.exp2(S_ij_minus_max) * mask2.to(S_ij.dtype)
+    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
     denominator = tl.sum(numerator, axis=1)
     P_ij = numerator / denominator
     
