@@ -32,7 +32,7 @@ def tile_start(i, j, seq_len, tile_start, kernel_size):
 
 def softmax_jacobian(x):
     B, H, T, C = x.shape
-    jacobian = torch.zeros(B, H, C, C, dtype=x.dtype)
+    jacobian = torch.zeros(B, H, C, C, dtype=x.dtype, device=x.device)
     for b in range(B):
         for h in range(H):  # Head dimension
             # Extract the softmax vector for this batch and head
@@ -172,7 +172,7 @@ class Natten2d(torch.autograd.Function):
         
         # Split q into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. The output of each tile is stored in o.
-        o = torch.zeros(B, N, H, W, C)
+        o = torch.zeros_like(q)
         k_tile_size = TILE_SIZE + kernel_size - 1
 
         for x in range(0, H, TILE_SIZE):
@@ -217,14 +217,18 @@ class Natten2d(torch.autograd.Function):
         # dQ has the same neighborhood pattern, but dK and dV need us to invert the
         # neighborhood mapping, which is not symmetric. 
 
-        dQ = torch.zeros(B, N, H, W, C)
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
         
         # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
         # of size Q_TILE_SIZE + kernel_size - 1. 
         k_tile_size = TILE_SIZE + kernel_size - 1
 
-        for x in range(0, H, TILE_SIZE):
-            for y in range(0, W, TILE_SIZE):
+        # for x in range(0, H, TILE_SIZE):
+        #     for y in range(0, W, TILE_SIZE):
+        for x in range(0, 1):
+            for y in range(0, 1):
                 dO_tile = dO[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
                 Q_tile = Q[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
 
@@ -254,8 +258,6 @@ class Natten2d(torch.autograd.Function):
                         dQ[:, :, x+xi:x+xi+1, y+yi:y+yi+1, :] = dQ_j.view(B, N, 1, 1, C)
 
         # Just do the naive thing for dK and dV. Can add tiling later.
-        dK = torch.zeros(B, N, H, W, C)
-        dV = torch.zeros(B, N, H, W, C)
         for x in range(H):
             xni = get_backward_window_start(x, kernel_size)
             xne = get_backward_window_end(x, H, kernel_size)

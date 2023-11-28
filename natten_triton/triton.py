@@ -38,14 +38,15 @@ def tile_start(i, j, seq_len, tile_start, kernel_size):
         return j
 
 @triton.jit
-def triton_softmax_jacobian(x, k_tile_size: tl.constexpr):
+def triton_softmax_jacobian(x, C: tl.constexpr):
     # First construct diagonal.
-    rows = tl.arange(0, k_tile_size)[:, None]
-    cols = tl.arange(0, k_tile_size)[None, :]
+    rows = tl.arange(0, C)[:, None]
+    cols = tl.arange(0, C)[None, :]
     diag = rows == cols
     diag = diag * x
     # Now outer product.
-    out_p = x[:, None] * x[None, :]
+    y = tl.reshape(x, (C,))
+    out_p = y[:, None] * y[None, :]
     return diag - out_p
 
 
@@ -182,9 +183,6 @@ def _attn_bwd_1d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
         order=(1, 0)
     )
     tl.store(dQ_block_ptr, dQ_j[None, :], boundary_check=(0, 1))
-    
-
-    pass
 
 @triton.jit
 def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out, 
@@ -239,7 +237,6 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
     S_ij = tl.sum(q * k, 1)
 
-
     # Compute softmax.
     S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
     numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
@@ -261,6 +258,86 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
         order=(2, 1, 0)
     )
     tl.store(O_block_ptr, o_ij[None, None, :], boundary_check=(0, 1, 2))
+
+@triton.jit
+def _attn_bwd_2d_dq(Q, K, V, kernel_size: tl.constexpr, dO, dQ,
+                    stride_qb, stride_qn, stride_qh, stride_qw, stride_qc,
+                    stride_kb, stride_kn, stride_kh, stride_kw, stride_kc,
+                    stride_vb, stride_vn, stride_vh, stride_vw, stride_vc,
+                    stride_dob, stride_don, stride_doh, stride_dow, stride_doc,
+                    stride_dqb, stride_dqn, stride_dqh, stride_dqw, stride_dqc,
+                    K_TILE_SIZE: tl.constexpr, B: tl.constexpr, N: tl.constexpr,
+                    H: tl.constexpr, W: tl.constexpr, C: tl.constexpr):
+    
+    bn_offset = tl.program_id(0)
+    hw_offset = tl.program_id(1)
+    b_offset = bn_offset // N
+    n_offset = bn_offset % N
+    h_offset = hw_offset // W
+    w_offset = hw_offset % W
+    qkv_offset = b_offset * stride_qb + n_offset * stride_qn
+    kv_start_x = triton_window_start(h_offset, H, kernel_size)
+    kv_start_y = triton_window_start(w_offset, W, kernel_size)
+
+    # Load Q
+    q_ptrs = Q + qkv_offset + h_offset * stride_qh + w_offset * stride_qw + tl.arange(0, C) * stride_qc
+    q = tl.load(q_ptrs)
+
+    # Load dO
+    do_ptrs = dO + qkv_offset + h_offset * stride_doh + w_offset * stride_dow + tl.arange(0, C) * stride_doc
+    do = tl.load(do_ptrs)
+    
+    k = tl.load(tl.make_block_ptr(
+        base=K + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_kh, stride_kw, stride_kc),
+        offsets=(kv_start_x, kv_start_y, 0),
+        block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
+        order=(2, 1, 0)
+    ))
+    v = tl.load(tl.make_block_ptr(
+        base=V + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_vh, stride_vw, stride_vc),
+        offsets=(kv_start_x, kv_start_y, 0),
+        block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
+        order=(2, 1, 0)
+    ))
+
+    mask = tl.arange(0, K_TILE_SIZE)
+    mask = tl.where(mask < kernel_size, 1, 0)
+    mask = mask[:, None] + mask[None, :]
+    mask = tl.where(mask > 1, 1, 0)
+    mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2,))
+
+    # Compute QK^T and dP_ij.
+    k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
+    S_ij = tl.sum(q * k, 1)
+    v = tl.reshape(v * mask[:, :, None], (K_TILE_SIZE**2, C))
+    dP_ij = tl.sum(do * v, 1)
+
+    # Compute softmax.
+    S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
+    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
+    denominator = tl.sum(numerator, axis=1)
+    P_ij = numerator / denominator
+    
+    # Now we compute the Jacobian of P_j and use it to get dS_j.
+    Jac_P_ij = triton_softmax_jacobian(P_ij, K_TILE_SIZE**2)
+    dS_ij = tl.sum(Jac_P_ij * dP_ij, 1)
+    dS_ij = tl.reshape(dS_ij, (K_TILE_SIZE**2, 1))
+    dQ_ij = tl.sum(dS_ij * k, 0)
+    
+    # Save dQ
+    dQ_block_ptr = tl.make_block_ptr(
+        base=dQ + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_dqh, stride_dqw, stride_dqc),
+        offsets=(h_offset, w_offset, 0),
+        block_shape=(1, 1, C),
+        order=(2, 1, 0)
+    )
+    tl.store(dQ_block_ptr, dQ_ij[None, None, :], boundary_check=(0, 1, 2))
 
 class Natten1d(torch.autograd.Function):
     @staticmethod
@@ -302,9 +379,9 @@ class Natten1d(torch.autograd.Function):
 
         dO = grad_output
 
-        dQ = torch.zeros(B, N, T, C, dtype=Q.dtype, device=Q.device)
-        dK = torch.zeros(B, N, T, C, dtype=Q.dtype, device=Q.device)
-        dV = torch.zeros(B, N, T, C, dtype=Q.dtype, device=Q.device)
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
 
         # Calculate next highest power of two greater than kernel_size
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
@@ -382,48 +459,23 @@ class Natten2d(torch.autograd.Function):
 
         dO = grad_output
 
-        # dQ has the same neighborhood pattern, but dK and dV need us to invert the
-        # neighborhood mapping, which is not symmetric. 
-
         dQ = torch.zeros_like(Q)
-        
-        # Split dO into tiles of size Q_TILE_SIZE. For each q tile, we load corresponding k and v tiles
-        # of size Q_TILE_SIZE + kernel_size - 1. 
-        k_tile_size = TILE_SIZE + kernel_size - 1
-
-        for x in range(0, H, TILE_SIZE):
-            for y in range(0, W, TILE_SIZE):
-                dO_tile = dO[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
-                Q_tile = Q[:, :, x:x+TILE_SIZE, y:y+TILE_SIZE, :]
-
-                # Load K and V tiles.
-                x_kv_start = get_window_start(x, H, kernel_size)
-                y_kv_start = get_window_start(y, W, kernel_size)
-                K_tile = K[:, :, x_kv_start:x_kv_start+k_tile_size, y_kv_start:y_kv_start+k_tile_size, :]
-                V_tile = V[:, :, x_kv_start:x_kv_start+k_tile_size, y_kv_start:y_kv_start+k_tile_size, :]
-
-                # Process each element in the query tile.
-                x_iter_max = min(TILE_SIZE, Q_tile.shape[2])
-                y_iter_max = min(TILE_SIZE, Q_tile.shape[3])
-                for xi in range(0, x_iter_max):
-                    for yi in range(0, y_iter_max):
-                        xj = tile_start(x, xi, H, x_kv_start, kernel_size)
-                        yj = tile_start(y, yi, W, y_kv_start, kernel_size)
-                        Q_ij = Q_tile[:, :, xi:xi+1, yi:yi+1, :].view(B, N, 1, C)
-                        K_ij = K_tile[:, :, xj:xj+kernel_size, yj:yj+kernel_size, :].reshape(B, N, kernel_size**2, C)
-                        S_j = Q_ij @ K_ij.transpose(-1, -2)
-                        P_j = torch.softmax(S_j, dim=-1)
-                        P_j_jacobian = softmax_jacobian(P_j)
-                        dO_ij = dO_tile[:, :, xi:xi+1, yi:yi+1, :].view(B, N, 1, C)
-                        V_ij = V_tile[:, :, xj:xj+kernel_size, yj:yj+kernel_size, :].reshape(B, N, kernel_size**2, C)
-                        dP_j = dO_ij @ V_ij.transpose(-1, -2)
-                        dS_j = torch.matmul(P_j_jacobian, dP_j.transpose(-1, -2)).transpose(-1, -2)
-                        dQ_j = dS_j @ K_ij
-                        dQ[:, :, x+xi:x+xi+1, y+yi:y+yi+1, :] = dQ_j.view(B, N, 1, 1, C)
-
-        # Just do the naive thing for dK and dV. Can add tiling later.
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
+
+        # Calculate next highest power of two greater than kernel_size
+        k_tile_size = 2 ** (kernel_size - 1).bit_length()
+
+        grid = (B*N, H*W)
+        _attn_bwd_2d_dq[grid](Q, K, V, kernel_size, dO, dQ,
+                            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3), Q.stride(4),
+                            K.stride(0), K.stride(1), K.stride(2), K.stride(3), K.stride(4),
+                            V.stride(0), V.stride(1), V.stride(2), V.stride(3), V.stride(4),
+                            dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3), dO.stride(4),
+                            dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3), dQ.stride(4),
+                            k_tile_size, B, N, H, W, C)
+        
+        # Just do the naive thing for dK and dV. Can add tiling later.
         for x in range(H):
             xni = get_backward_window_start(x, kernel_size)
             xne = get_backward_window_end(x, H, kernel_size)
