@@ -122,7 +122,7 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
 
     # Compute softmax.
     S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
-    numerator = tl.where(mask, tl.exp(S_j_minus_max), 0)
+    numerator = tl.where(mask, tl.math.exp2(S_j_minus_max), 0)
     denominator = tl.sum(numerator, axis=0)
     P_j = numerator / denominator
 
@@ -189,7 +189,7 @@ def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
 
     # Compute softmax.
     S_j_minus_max = S_j - tl.max(S_j, axis=0) # Subtract max for numeric stability
-    numerator = tl.where(mask, tl.exp(S_j_minus_max), 0)
+    numerator = tl.where(mask, tl.math.exp2(S_j_minus_max), 0)
     denominator = tl.sum(numerator, axis=0)
     P_j = numerator / denominator
 
@@ -221,6 +221,17 @@ def _attn_bwd_1d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
     dV_update_ptr = dV + qkv_offset + kv_start * stride_dvt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvt + tl.arange(0, C) * stride_dvc
     tl.atomic_add(dV_update_ptr, dV_update)
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=32),
+    ],
+    key=["B", "N", "H", "W", "C", "kernel_size"],
+)
 @triton.jit
 def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out, 
                  stride_qb, stride_qn, stride_qh, stride_qw, stride_qc,
@@ -234,11 +245,10 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     assert stride_kn == stride_qn and stride_vn == stride_qn and stride_on == stride_qn
 
     bn_offset = tl.program_id(0)
-    hw_offset = tl.program_id(1)
+    h_offset = tl.program_id(1)
+    w_offset = tl.program_id(2)
     b_offset = bn_offset // N
     n_offset = bn_offset % N
-    h_offset = hw_offset // W
-    w_offset = hw_offset % W
     qkv_offset = b_offset * stride_qb + n_offset * stride_qn
     kv_start_x = triton_window_start(h_offset, H, kernel_size)
     kv_start_y = triton_window_start(w_offset, W, kernel_size)
@@ -282,7 +292,7 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
 
     # Compute softmax.
     S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
-    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
+    numerator = tl.math.exp2(S_ij_minus_max) * mask2.to(S_ij.dtype)
     denominator = tl.sum(numerator, axis=1)
     P_ij = numerator / denominator
     
@@ -382,7 +392,7 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
 
     # Compute softmax.
     S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
-    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
+    numerator = tl.math.exp2(S_ij_minus_max) * mask2.to(S_ij.dtype)
     denominator = tl.sum(numerator, axis=1)
     P_ij = numerator / denominator
     
@@ -499,7 +509,7 @@ class Natten2d(torch.autograd.Function):
         # Calculate next highest power of two greater than kernel_size
         k_tile_size = 2 ** (kernel_size - 1).bit_length()
 
-        grid = (B*N, H*W)
+        grid = (B*N, H, W)
         _attn_fwd_2d[grid](Q, K, V, kernel_size, o,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3), Q.stride(4),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3), K.stride(4),
