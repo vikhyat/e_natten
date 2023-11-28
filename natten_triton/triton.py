@@ -115,6 +115,9 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
                  K_TILE_SIZE: tl.constexpr, B: tl.constexpr, N: tl.constexpr,
                  H: tl.constexpr, W: tl.constexpr, C: tl.constexpr):
 
+    assert stride_kb == stride_qb and stride_vb == stride_qb and stride_ob == stride_qb
+    assert stride_kn == stride_qn and stride_vn == stride_qn and stride_on == stride_qn
+
     bn_offset = tl.program_id(0)
     hw_offset = tl.program_id(1)
     b_offset = bn_offset // N
@@ -150,10 +153,10 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     mask = tl.where(mask < kernel_size, 1, 0)
     mask = mask[:, None] + mask[None, :]
     mask = tl.where(mask > 1, 1, 0)
-    mask2 = tl.view(mask, (1, K_TILE_SIZE**2,))
+    mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2,))
 
     # Compute QK^T.
-    k = tl.view(k * mask[:, :, None], (K_TILE_SIZE**2, C))
+    k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
     S_ij = tl.sum(q * k, 1)
 
 
