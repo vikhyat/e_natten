@@ -17,7 +17,7 @@ memory.
 
 Forward and backward pass comparison of the fused and original natten implementation. Run with
 batch size 4, 4 heads, head dimension 128, and kernel size 5. The parameter on the x-axis is the
-image size in 2D, so the number of tokens is the square of this value. All experiments run on
+image size in 2D, so the number of tokens is the square of this value. All experiments were run on
 an A100 GPU.
 
 | Forward Pass | Backward Pass |

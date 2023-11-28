@@ -15,7 +15,7 @@ from natten.functional import natten2dqk, natten2dav
         plot_name=f"2d-fwd",
     )
 ])
-def bench_fwd(B, N, D, C, kernel_size, provider):
+def bench_2d_fwd(B, N, D, C, kernel_size, provider):
     q, k, v = torch.randn((3, B, N, D, D, C)).cuda()
     if provider == 'triton':
         fn = lambda: natten2d(q, k, v, kernel_size)
@@ -40,7 +40,7 @@ def bench_fwd(B, N, D, C, kernel_size, provider):
         plot_name=f"2d-bwd",
     )
 ])
-def bench_bwd(B, N, D, C, kernel_size, provider):
+def bench_2d_bwd(B, N, D, C, kernel_size, provider):
     q, k, v = torch.randn((3, B, N, D, D, C)).requires_grad_().cuda()
     if provider == 'triton':
         def fn():
@@ -59,5 +59,5 @@ def bench_bwd(B, N, D, C, kernel_size, provider):
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     return ms
 
-bench_fwd.run(save_path="assets", print_data=True)
-bench_bwd.run(save_path="assets", print_data=True)
+bench_2d_fwd.run(save_path="assets", print_data=True)
+bench_2d_bwd.run(save_path="assets", print_data=True)

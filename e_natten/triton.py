@@ -310,8 +310,8 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
                     stride_dqb, stride_dqn, stride_dqh, stride_dqw, stride_dqc,
                     stride_dkb, stride_dkn, stride_dkh, stride_dkw, stride_dkc,
                     stride_dvb, stride_dvn, stride_dvh, stride_dvw, stride_dvc,
-                    K_TILE_SIZE: tl.constexpr, B: tl.constexpr, N: tl.constexpr,
-                    H: tl.constexpr, W: tl.constexpr, C: tl.constexpr):
+                    TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr, B: tl.constexpr,
+                    N: tl.constexpr, H: tl.constexpr, W: tl.constexpr, C: tl.constexpr):
     
     assert (stride_kb == stride_qb and stride_vb == stride_qb and stride_dob == stride_qb
             and stride_dqb == stride_qb and stride_dkb == stride_qb and stride_dvb == stride_qb)
@@ -319,101 +319,108 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
             and stride_dqn == stride_qn and stride_dkn == stride_qn and stride_dvn == stride_qn)
     
     bn_offset = tl.program_id(0)
-    h_offset = tl.program_id(1)
-    w_offset = tl.program_id(2)
+    h_offset_b = tl.program_id(1)
+    w_offset_b = tl.program_id(2)
     b_offset = bn_offset // N
     n_offset = bn_offset % N
     qkv_offset = b_offset * stride_qb + n_offset * stride_qn
-    kv_start_x = triton_window_start(h_offset, H, kernel_size)
-    kv_start_y = triton_window_start(w_offset, W, kernel_size)
 
-    # Load Q
-    q = tl.load(tl.make_block_ptr(
+    q_block_ptr = tl.make_block_ptr(
         base=Q + qkv_offset,
         shape=(H, W, C),
         strides=(stride_qh, stride_qw, stride_qc),
-        offsets=(h_offset, w_offset, 0),
-        block_shape=(1, 1, C),
-        order=(2, 1, 0)
-    ), boundary_check=(0, 1, 2))
-    q = tl.reshape(q, (1, C))
-
-    # Load dO
-    do = tl.load(tl.make_block_ptr(
-        base=dO + qkv_offset,
-        shape=(H, W, C),
-        strides=(stride_doh, stride_dow, stride_doc),
-        offsets=(h_offset, w_offset, 0),
-        block_shape=(1, 1, C),
-        order=(2, 1, 0)
-    ), boundary_check=(0, 1, 2))
-    do = tl.reshape(do, (1, C))
-    
-    k = tl.load(tl.make_block_ptr(
-        base=K + qkv_offset,
-        shape=(H, W, C),
-        strides=(stride_kh, stride_kw, stride_kc),
-        offsets=(kv_start_x, kv_start_y, 0),
-        block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
-        order=(2, 1, 0)
-    ), boundary_check=(0, 1, 2))
-    v = tl.load(tl.make_block_ptr(
-        base=V + qkv_offset,
-        shape=(H, W, C),
-        strides=(stride_vh, stride_vw, stride_vc),
-        offsets=(kv_start_x, kv_start_y, 0),
-        block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
-        order=(2, 1, 0)
-    ), boundary_check=(0, 1, 2))
-
-    mask = tl.arange(0, K_TILE_SIZE)
-    mask = tl.where(mask < kernel_size, 1, 0)
-    mask = mask[:, None] + mask[None, :]
-    mask = tl.where(mask > 1, 1, 0)
-    mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2,))
-
-    # Compute QK^T and dP_ij.
-    k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
-    S_ij = tl.sum(q * k, 1)
-    v = tl.reshape(v * mask[:, :, None], (K_TILE_SIZE**2, C))
-    dP_ij = tl.sum(do * v, 1)
-
-    # Compute softmax.
-    S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
-    numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
-    denominator = tl.sum(numerator, axis=1)
-    P_ij = numerator / denominator
-    
-    # Now we compute the Jacobian of P_j and use it to get dS_j.
-    Jac_P_ij = triton_softmax_jacobian(P_ij, K_TILE_SIZE**2)
-    dS_ij = tl.sum(Jac_P_ij * dP_ij, 1)
-    dS_ij = tl.reshape(dS_ij, (K_TILE_SIZE**2, 1))
-    dQ_ij = tl.sum(dS_ij * k, 0)
-    
-    # Save dQ.
-    dQ_block_ptr = tl.make_block_ptr(
-        base=dQ + qkv_offset,
-        shape=(H, W, C),
-        strides=(stride_dqh, stride_dqw, stride_dqc),
-        offsets=(h_offset, w_offset, 0),
+        offsets=(0, 0, 0),
         block_shape=(1, 1, C),
         order=(2, 1, 0)
     )
-    tl.store(dQ_block_ptr, dQ_ij[None, None, :], boundary_check=(0, 1, 2))
-    
-    # Update dK.
-    dK_update = q * dS_ij[:, None]
-    dK_update = dK_update.to(dK.dtype.element_ty)
-    dK_update = tl.reshape(dK_update, (K_TILE_SIZE, K_TILE_SIZE, C))
-    dK_update_ptr = dK + qkv_offset + kv_start_x * stride_dkh + kv_start_y * stride_dkw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dkh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dkw + tl.arange(0, C) * stride_dkc
-    tl.atomic_add(dK_update_ptr, dK_update)
+    do_block_ptr = tl.make_block_ptr(
+        base=dO + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_doh, stride_dow, stride_doc),
+        offsets=(0, 0, 0),
+        block_shape=(1, 1, C),
+        order=(2, 1, 0)
+    )
 
-    # Update dV.
-    P_ij = tl.reshape(P_ij, (K_TILE_SIZE, K_TILE_SIZE, 1))
-    dV_update = P_ij * do[None, :]
-    dV_update = dV_update.to(dV.dtype.element_ty)
-    dV_update_ptr = dV + qkv_offset + kv_start_x * stride_dvh + kv_start_y * stride_dvw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dvh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvw + tl.arange(0, C) * stride_dvc
-    tl.atomic_add(dV_update_ptr, dV_update)
+    for h_offset in range(h_offset_b * TILE_SIZE, (h_offset_b + 1) * TILE_SIZE):
+        h_offset = tl.multiple_of(h_offset, TILE_SIZE)
+        for w_offset in range(w_offset_b * TILE_SIZE, (w_offset_b + 1) * TILE_SIZE):
+            w_offset = tl.multiple_of(w_offset, TILE_SIZE)
+
+            kv_start_x = triton_window_start(h_offset, H, kernel_size)
+            kv_start_y = triton_window_start(w_offset, W, kernel_size)
+
+            # Load Q and dO.
+            q = tl.load(tl.advance(q_block_ptr, (h_offset, w_offset, 0)), boundary_check=(0, 1, 2))
+            q = tl.reshape(q, (1, C))
+            do = tl.load(tl.advance(do_block_ptr, (h_offset, w_offset, 0)), boundary_check=(0, 1, 2))
+            do = tl.reshape(do, (1, C))
+            
+            k = tl.load(tl.make_block_ptr(
+                base=K + qkv_offset,
+                shape=(H, W, C),
+                strides=(stride_kh, stride_kw, stride_kc),
+                offsets=(kv_start_x, kv_start_y, 0),
+                block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
+                order=(2, 1, 0)
+            ), boundary_check=(0, 1, 2))
+            v = tl.load(tl.make_block_ptr(
+                base=V + qkv_offset,
+                shape=(H, W, C),
+                strides=(stride_vh, stride_vw, stride_vc),
+                offsets=(kv_start_x, kv_start_y, 0),
+                block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
+                order=(2, 1, 0)
+            ), boundary_check=(0, 1, 2))
+
+            mask = tl.arange(0, K_TILE_SIZE)
+            mask = tl.where(mask < kernel_size, 1, 0)
+            mask = mask[:, None] + mask[None, :]
+            mask = tl.where(mask > 1, 1, 0)
+            mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2,))
+
+            # Compute QK^T and dP_ij.
+            k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
+            S_ij = tl.sum(q * k, 1)
+            v = tl.reshape(v * mask[:, :, None], (K_TILE_SIZE**2, C))
+            dP_ij = tl.sum(do * v, 1)
+
+            # Compute softmax.
+            S_ij_minus_max = S_ij - tl.max(S_ij, axis=0) # Subtract max for numeric stability
+            numerator = tl.exp(S_ij_minus_max) * mask2.to(S_ij.dtype)
+            denominator = tl.sum(numerator, axis=1)
+            P_ij = numerator / denominator
+            
+            # Now we compute the Jacobian of P_j and use it to get dS_j.
+            Jac_P_ij = triton_softmax_jacobian(P_ij, K_TILE_SIZE**2)
+            dS_ij = tl.sum(Jac_P_ij * dP_ij, 1)
+            dS_ij = tl.reshape(dS_ij, (K_TILE_SIZE**2, 1))
+            dQ_ij = tl.sum(dS_ij * k, 0)
+            
+            # Save dQ.
+            dQ_block_ptr = tl.make_block_ptr(
+                base=dQ + qkv_offset,
+                shape=(H, W, C),
+                strides=(stride_dqh, stride_dqw, stride_dqc),
+                offsets=(h_offset, w_offset, 0),
+                block_shape=(1, 1, C),
+                order=(2, 1, 0)
+            )
+            tl.store(dQ_block_ptr, dQ_ij[None, None, :], boundary_check=(0, 1, 2))
+            
+            # Update dK.
+            dK_update = q * dS_ij[:, None]
+            dK_update = dK_update.to(dK.dtype.element_ty)
+            dK_update = tl.reshape(dK_update, (K_TILE_SIZE, K_TILE_SIZE, C))
+            dK_update_ptr = dK + qkv_offset + kv_start_x * stride_dkh + kv_start_y * stride_dkw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dkh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dkw + tl.arange(0, C) * stride_dkc
+            tl.atomic_add(dK_update_ptr, dK_update)
+
+            # Update dV.
+            P_ij = tl.reshape(P_ij, (K_TILE_SIZE, K_TILE_SIZE, 1))
+            dV_update = P_ij * do[None, :]
+            dV_update = dV_update.to(dV.dtype.element_ty)
+            dV_update_ptr = dV + qkv_offset + kv_start_x * stride_dvh + kv_start_y * stride_dvw + tl.arange(0, K_TILE_SIZE)[:, None, None] * stride_dvh + tl.arange(0, K_TILE_SIZE)[:, None] * stride_dvw + tl.arange(0, C) * stride_dvc
+            tl.atomic_add(dV_update_ptr, dV_update)
 
 class Natten1d(torch.autograd.Function):
     @staticmethod
@@ -522,10 +529,12 @@ class Natten2d(torch.autograd.Function):
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
 
-        # Calculate next highest power of two greater than kernel_size
-        k_tile_size = 2 ** (kernel_size - 1).bit_length()
+        tile_size = 3
+        k_tile_size = tile_size + kernel_size - 1
+        k_tile_size = 2 ** (k_tile_size - 1).bit_length()
+        tile_size = k_tile_size - kernel_size + 1
 
-        grid = (B*N, H, W)
+        grid = (B*N, triton.cdiv(H, tile_size), triton.cdiv(W, tile_size))
         _attn_bwd_2d[grid](Q, K, V, kernel_size, dO, dQ, dK, dV,
                             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3), Q.stride(4),
                             K.stride(0), K.stride(1), K.stride(2), K.stride(3), K.stride(4),
@@ -534,7 +543,7 @@ class Natten2d(torch.autograd.Function):
                             dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3), dQ.stride(4),
                             dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3), dK.stride(4),
                             dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3), dV.stride(4),
-                            k_tile_size, B, N, H, W, C)
+                            tile_size, k_tile_size, B, N, H, W, C)
         
         return dQ, dK, dV, None
 
