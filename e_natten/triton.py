@@ -82,16 +82,37 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
     kv_start = triton_window_start(t_offset, T, kernel_size)
     
     # Load Q
-    q_ptrs = Q + qkv_offset + t_offset * stride_qt + tl.arange(0, C) * stride_qc
-    q = tl.load(q_ptrs)
+    q_block_ptr = tl.make_block_ptr(
+        base=Q + qkv_offset,
+        shape=(T, C),
+        strides=(stride_qt, stride_qc),
+        offsets=(t_offset, 0),
+        block_shape=(1, C),
+        order=(1, 0)
+    )
+    q = tl.load(q_block_ptr, boundary_check=(0, 1))
     
     # Load K
-    k_ptrs = K + qkv_offset + kv_start * stride_kt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_kt + tl.arange(0, C) * stride_kc
-    k = tl.load(k_ptrs)
+    k_block_ptr = tl.make_block_ptr(
+        base=K + qkv_offset,
+        shape=(T, C),
+        strides=(stride_kt, stride_kc),
+        offsets=(kv_start, 0),
+        block_shape=(K_TILE_SIZE, C),
+        order=(1, 0)
+    )
+    k = tl.load(k_block_ptr, boundary_check=(0, 1))
 
     # Load V
-    v_ptrs = V + qkv_offset + kv_start * stride_vt + tl.arange(0, K_TILE_SIZE)[:, None] * stride_vt + tl.arange(0, C) * stride_vc
-    v = tl.load(v_ptrs)
+    v_block_ptr = tl.make_block_ptr(
+        base=V + qkv_offset,
+        shape=(T, C),
+        strides=(stride_vt, stride_vc),
+        offsets=(kv_start, 0),
+        block_shape=(K_TILE_SIZE, C),
+        order=(1, 0)
+    )
+    v = tl.load(v_block_ptr, boundary_check=(0, 1))
 
     k_idx_range = tl.arange(0, K_TILE_SIZE)
     mask = k_idx_range < kernel_size
@@ -106,7 +127,7 @@ def _attn_fwd_1d(Q, K, V, kernel_size: tl.constexpr, Out,
     P_j = numerator / denominator
 
     # Compute output.
-    o_j = tl.sum(P_j[:, None] * v, 0)
+    o_j = tl.sum(P_j[:, None] * v, 0).to(Out.dtype.element_ty)
 
     # Save output.
     O_block_ptr = tl.make_block_ptr(
@@ -222,10 +243,15 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     kv_start_x = triton_window_start(h_offset, H, kernel_size)
     kv_start_y = triton_window_start(w_offset, W, kernel_size)
 
-    # Load Q
-    q_ptrs = Q + qkv_offset + h_offset * stride_qh + w_offset * stride_qw + tl.arange(0, C) * stride_qc
-    q = tl.load(q_ptrs)
-    
+    # Load Q, K and V.
+    q = tl.load(tl.make_block_ptr(
+        base=Q + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_qh, stride_qw, stride_qc),
+        offsets=(h_offset, w_offset, 0),
+        block_shape=(1, 1, C),
+        order=(2, 1, 0)
+    ), boundary_check=(0, 1, 2))
     k = tl.load(tl.make_block_ptr(
         base=K + qkv_offset,
         shape=(H, W, C),
@@ -233,7 +259,7 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
         offsets=(kv_start_x, kv_start_y, 0),
         block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
         order=(2, 1, 0)
-    ))
+    ), boundary_check=(0, 1, 2))
     v = tl.load(tl.make_block_ptr(
         base=V + qkv_offset,
         shape=(H, W, C),
@@ -241,15 +267,16 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
         offsets=(kv_start_x, kv_start_y, 0),
         block_shape=(K_TILE_SIZE, K_TILE_SIZE, C),
         order=(2, 1, 0)
-    ))
+    ), boundary_check=(0, 1, 2))
 
     mask = tl.arange(0, K_TILE_SIZE)
     mask = tl.where(mask < kernel_size, 1, 0)
     mask = mask[:, None] + mask[None, :]
     mask = tl.where(mask > 1, 1, 0)
-    mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2,))
+    mask2 = tl.reshape(mask, (1, K_TILE_SIZE**2))
 
     # Compute QK^T.
+    q = tl.reshape(q, (1, C))
     k = tl.reshape(k * mask[:, :, None], (K_TILE_SIZE**2, C))
     S_ij = tl.sum(q * k, 1)
 
@@ -262,7 +289,7 @@ def _attn_fwd_2d(Q, K, V, kernel_size: tl.constexpr, Out,
     # Compute output.
     P_ij = tl.reshape(P_ij, (K_TILE_SIZE**2, 1))
     v = tl.reshape(v * mask[:, :, None], (K_TILE_SIZE**2, C))
-    o_ij = tl.sum(P_ij * v, 0)
+    o_ij = tl.sum(P_ij * v, 0).to(Out.dtype.element_ty)
 
     # Save output.
     O_block_ptr = tl.make_block_ptr(
@@ -303,12 +330,26 @@ def _attn_bwd_2d(Q, K, V, kernel_size: tl.constexpr, dO, dQ, dK, dV,
     kv_start_y = triton_window_start(w_offset, W, kernel_size)
 
     # Load Q
-    q_ptrs = Q + qkv_offset + h_offset * stride_qh + w_offset * stride_qw + tl.arange(0, C) * stride_qc
-    q = tl.load(q_ptrs)
+    q = tl.load(tl.make_block_ptr(
+        base=Q + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_qh, stride_qw, stride_qc),
+        offsets=(h_offset, w_offset, 0),
+        block_shape=(1, 1, C),
+        order=(2, 1, 0)
+    ), boundary_check=(0, 1, 2))
+    q = tl.reshape(q, (1, C))
 
     # Load dO
-    do_ptrs = dO + qkv_offset + h_offset * stride_doh + w_offset * stride_dow + tl.arange(0, C) * stride_doc
-    do = tl.load(do_ptrs)
+    do = tl.load(tl.make_block_ptr(
+        base=dO + qkv_offset,
+        shape=(H, W, C),
+        strides=(stride_doh, stride_dow, stride_doc),
+        offsets=(h_offset, w_offset, 0),
+        block_shape=(1, 1, C),
+        order=(2, 1, 0)
+    ), boundary_check=(0, 1, 2))
+    do = tl.reshape(do, (1, C))
     
     k = tl.load(tl.make_block_ptr(
         base=K + qkv_offset,

@@ -1,30 +1,69 @@
 import torch
 import triton
-from e_natten import natten1d
-from natten.functional import natten1dqk, natten1dav
+from e_natten import natten2d
+from natten.functional import natten2dqk, natten2dav
+from einops import rearrange
 
-configs = []
-configs.append(triton.testing.Benchmark(
-    x_names=['Sequence Length'],
-    x_vals=[2**i for i in range(8, 16)],
-    line_arg="provider",
-    line_vals=['triton', 'natten'],
-    line_names=['Natten (triton)', 'Natten (original)'],
-    ylabel='time (ms)',
-    args={'B': 4, 'N': 12, 'C': 1024, 'kernel_size': 5},
-    plot_name=f"1d-fwd",
-))
-
-@triton.testing.perf_report(configs)
-def bench_1d_fwd(B, N, T, C, kernel_size, provider):
-    q, k, v = torch.randn((3, B, N, T, C)).cuda()
+@triton.testing.perf_report([
+    triton.testing.Benchmark(
+        x_names=['D'],
+        x_vals=[2**i for i in range(5, 7)],
+        line_arg="provider",
+        line_vals=['triton', 'natten'],
+        line_names=['e_natten (fused)', 'natten (original)'],
+        ylabel='time (ms)',
+        args={'B': 32, 'N': 8, 'C': 256, 'kernel_size': 5},
+        plot_name=f"2d-fwd",
+    )
+])
+def bench_fwd(B, N, D, C, kernel_size, provider):
+    q, k, v = torch.randn((3, B, N, D, D, C), dtype=torch.float16).cuda()
     if provider == 'triton':
-        fn = lambda: natten1d(q, k, v, kernel_size)
+        fn = lambda: natten2d(q, k, v, kernel_size)
     elif provider == 'natten':
-        fn = lambda: natten1dav(torch.softmax(natten1dqk(q, k, kernel_size, 1), dim=-1), v, kernel_size, 1)
-    warmup = 25
-    rep = 1000
+        fn = lambda: natten2dav(torch.softmax(natten2dqk(q, k, kernel_size, 1), dim=-1), v, kernel_size, 1)
+
+    warmup = 100
+    rep = 200
+    with torch.no_grad():
+        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return ms
+
+@triton.testing.perf_report([
+    triton.testing.Benchmark(
+        x_names=['T'],
+        x_vals=[2**i for i in range(5, 10)],
+        line_arg="provider",
+        line_vals=['triton', 'natten', 'flash'],
+        line_names=['e_natten (fused)', 'natten (original)', 'flash attention (v2)'],
+        ylabel='time (ms)',
+        args={'B': 32, 'N': 8, 'C': 256, 'kernel_size': 5},
+        plot_name=f"2d-bwd",
+    )
+])
+def bench_1d_bwd(B, N, T, C, kernel_size, provider):
+    q, k, v = torch.randn((3, B, N, T, C), dtype=torch.float16).cuda()
+    if provider == 'triton':
+        def fn():
+            out = natten2d(q, k, v, kernel_size)
+            loss = torch.sum(out ** 2)
+            loss.backward()
+            q.grad.zero_()
+            k.grad.zero_()
+            v.grad.zero_()
+    elif provider == 'natten':
+        def fn():
+            s = natten2dqk(q, k, kernel_size, 1)
+            p = torch.softmax(s, dim=-1)
+            o = natten2dav(p, v, kernel_size, 1)
+            loss = torch.sum(o ** 2)
+            loss.backward()
+            q.grad.zero_()
+            k.grad.zero_()
+            v.grad.zero_()
+    warmup = 100
+    rep = 200
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     return ms
 
-bench_1d_fwd.run(save_path=".", print_data=True)
+bench_fwd.run(save_path=".", print_data=True)
